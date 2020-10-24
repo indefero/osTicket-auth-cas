@@ -1,5 +1,6 @@
 <?php
 require_once(dirname(__file__).'/lib/jasig/phpcas/CAS.php');
+define('CAS_DEBUG_MODE', false);
 
 class CasAuth {
   private $config;
@@ -8,20 +9,33 @@ class CasAuth {
     $this->config = $config;
   }
 
-  private static function buildClient($hostname, $port, $context) {
+  private static function buildClient($hostname, $port, $context, $version) {
+    if (CAS_DEBUG_MODE) {
+      phpCAS::setDebug(join(DIRECTORY_SEPARATOR, array(getenv('TEMP'), 'phpCAS.log')));
+    }
     phpCAS::client(
-      CAS_VERSION_2_0,
+      $version,
       $hostname,
       intval($port),
       $context,
       false);
+    if (CAS_DEBUG_MODE) {
+      phpCAS::setExtraCurlOption(CURLOPT_SSL_VERIFYHOST, 0);
+      phpCAS::setExtraCurlOption(CURLOPT_SSL_VERIFYPEER, false);
+    }
+  }
+
+  private static function buildClientFromConfig($config) {
+    self::buildClient(
+      $config->get('cas-hostname'),
+      $config->get('cas-port'),
+      $config->get('cas-context'),
+      $config->get('cas-version')
+    );
   }
 
   public function triggerAuth($service_url = null) {
-    self::buildClient(
-      $this->config->get('cas-hostname'),
-      $this->config->get('cas-port'),
-      $this->config->get('cas-context'));
+    self::buildClientFromConfig($this->config);
 
     // Force set the CAS service URL to the osTicket login page.
     if ($service_url) {
@@ -42,15 +56,12 @@ class CasAuth {
       $this->setUser();
       $this->setEmail();
       $this->setName();
+      $this->setCustomFields();
     }
   }
 
   public static function signOut($config, $return_url = null) {
-    self::buildClient(
-      $config->get('cas-hostname'),
-      $config->get('cas-port'),
-      $config->get('cas-context'));
-
+    self::buildClientFromConfig($config);
     unset($_SESSION[':cas']);
 
     if ($config->get('cas-single-sign-off')) {
@@ -62,6 +73,8 @@ class CasAuth {
     }
   }
 
+  // NOTE: User in this context is CAS user, not osTicket username;
+  //       see getUsername() for osTicket username
   public function setUser() {
     $_SESSION[':cas']['user'] = phpCAS::getUser();
   }
@@ -77,6 +90,9 @@ class CasAuth {
     } else {
       $email = $this->getUser();
       if($this->config->get('cas-at-domain') !== null) {
+        if (substr($this->config->get('cas-at-domain'), 0, 1) !== "@") {
+          $email .= '@';
+        }
         $email .= $this->config->get('cas-at-domain');
       }
       $_SESSION[':cas']['email'] = $email;
@@ -100,10 +116,60 @@ class CasAuth {
     return $_SESSION[':cas']['name'];
   }
 
+  private function setCustomFields() {
+    $custom = array();
+    if(!empty($this->config->get('cas-custom-attributes'))) {
+      // parse rows by splitting newlines, then map to columns
+      $attrs = array_map('str_getcsv', str_getcsv($this->config->get('cas-custom-attributes'), "\n"));
+      // iterate over rows of ["claim-attribute", "form-field"]
+      foreach ($attrs as &$x) {
+        // NOTE: fields are validated in config.php, only need to check if CAS has attr
+        if(phpCAS::hasAttribute(trim($x[0]))) {
+          $custom[trim($x[1])] = phpCAS::getAttribute(trim($x[0]));
+        }
+      }
+    }
+    $_SESSION[':cas']['custom'] = json_encode($custom);
+  }
+
+  public function getCustomFields() {
+    return json_decode($_SESSION[':cas']['custom'], true, 2, JSON_THROW_ON_ERROR);
+  }
+
   public function getProfile() {
-    return array(
-      'email' => $this->getEmail(),
-      'name' => $this->getName());
+    return array_merge($this->getCustomFields(), array(
+        'email' => $this->getEmail(),
+        'name' => $this->getName()
+      ));
+  }
+
+  public function getUsernameField() {
+    $field = $this->config->get('cas-username-form-field');
+    if($field === null) {
+      $field = 'email';
+    }
+    return $field;
+  }
+
+  // NOTE: Username in this context is osTicket username, not CAS user;
+  //       see getUser() for CAS user
+  public function getUsername() {
+    $key = $this->getUsernameField();
+    switch ($key) {
+      case 'email':
+        return $this->getEmail();
+        break;
+      case 'username':
+        $info = $this->getCustomFields();
+        if(array_key_exists('username', $info)) {
+          return $info['username'];
+        }
+        return $this->getUser();
+        break;
+      default:
+        // should never happen
+        trigger_error("cas-username-form-field is malformed: expected value 'email' or 'username'", E_USER_ERROR);
+    }
   }
 }
 
@@ -134,8 +200,8 @@ class CasStaffAuthBackend extends ExternalStaffAuthenticationBackend {
   }
 
   function signOn() {
-    if (isset($_SESSION[':cas']['user'])) {
-      if (($staff = StaffSession::lookup($this->cas->getEmail()))
+    if (isset($_SESSION[':cas'])) {
+      if (($staff = StaffSession::lookup($this->cas->getUsername()))
         && $staff->getId()) {
         if (!$staff instanceof StaffSession) {
           // osTicket <= v1.9.7 or so
@@ -211,7 +277,8 @@ class CasClientAuthBackend extends ExternalUserAuthenticationBackend {
     global $cfg;
 
     if (isset($_SESSION[':cas'])) {
-      $acct = ClientAccount::lookupByUsername($this->cas->getEmail());
+      $username = $this->cas->getUsername();
+      $acct = ClientAccount::lookupByUsername($username);
       $client = null;
       if ($acct && $acct->getId()) {
         $client = new ClientSession(new EndUser($acct->getUser()));
@@ -219,7 +286,7 @@ class CasClientAuthBackend extends ExternalUserAuthenticationBackend {
 
       if (!$client) {
         $client = new ClientCreateRequest(
-          $this, $this->cas->getEmail(), $this->cas->getProfile());
+          $this, $username, $this->cas->getProfile());
         if (!$cfg || !$cfg->isClientRegistrationEnabled() && self::$config->get('cas-force-register')) {
           $client = $client->attemptAutoRegister();
         }

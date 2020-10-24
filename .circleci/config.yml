@@ -1,0 +1,60 @@
+only-deploy-tags: &only-version-tags
+  filters:
+    tags:
+      only: /^v.*/
+    branches:
+      ignore: /.*/
+
+version: 2
+jobs:
+  build:
+    docker:
+      - image: circleci/php:7.1
+    environment:
+      CROWDIN_PROJECT: $CROWDIN_PROJECT
+      CROWDIN_API_KEY: $CROWDIN_API_KEY
+    steps:
+      - checkout
+      - attach_workspace:
+            at: /tmp/workspace
+
+      - run: sudo apt update
+      - run: make
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - build
+
+      - store_artifacts:
+          path: build/auth-cas.phar
+  publish-github-release:
+    docker:
+      - image: cibuilds/github:0.13
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: "Publish Release on GitHub"
+          command: |
+            ghr \
+              -t ${GITHUB_TOKEN} \
+              -u ${CIRCLE_PROJECT_USERNAME} \
+              -r ${CIRCLE_PROJECT_REPONAME} \
+              -c ${CIRCLE_SHA1} \
+              -delete \
+              ${CIRCLE_TAG} /tmp/workspace/build/auth-cas.phar
+
+workflows:
+  version: 2
+  untagged-build:
+    jobs:
+      - build
+  release-build:
+    jobs:
+      - build: *only-version-tags
+      - publish-github-release:
+          <<: *only-version-tags
+          requires:
+            - build
+
